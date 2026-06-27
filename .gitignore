@@ -1,0 +1,6 @@
+# Binary archives
+*.tgz
+*.tar.gz
+*.tar.xz
+*.zip
+*.tar
