@@ -157,6 +157,20 @@ install_postgres() {
     systemctl enable --now postgresql
     ok "PostgreSQL installed"
   fi
+
+  # Install pgvector separately — runs even if PostgreSQL was already present.
+  # Detect the actual running major version rather than assuming POSTGRES_MAJOR.
+  local pg_major
+  pg_major=$(psql --version 2>/dev/null | grep -oP '\d+' | head -1)
+  if sudo -u postgres psql -c "SELECT extversion FROM pg_extension WHERE extname='vector';" 2>/dev/null | grep -q '[0-9]'; then
+    ok "pgvector already installed in PostgreSQL"
+  elif apt-get install -y "postgresql-${pg_major}-pgvector" 2>/dev/null; then
+    ok "pgvector installed (postgresql-${pg_major}-pgvector)"
+  else
+    warn "pgvector package not found for PostgreSQL ${pg_major} — face embedding features will not work"
+    warn "Try manually: apt-get install postgresql-${pg_major}-pgvector"
+  fi
+
   provision_db
 }
 

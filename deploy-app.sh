@@ -53,7 +53,7 @@ AUTH_MODE=keycloak
 # Database
 DB_HOST=localhost
 DB_PORT=5432
-DB_NAME=FRS
+DB_NAME=attendance_intelligence
 DB_USER=postgres
 DB_PASSWORD=
 DB_SSL=false
@@ -859,9 +859,29 @@ build_frontend() {
 run_migrations() {
   log "Running database migrations"
 
-  # Ensure pgvector extension is installed
+  # ── Ensure DB user exists ────────────────────────────────────────────────────
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" 2>/dev/null | grep -q 1; then
+    info "Creating database user '${DB_USER}'..."
+    sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}';" 2>/dev/null \
+      || warn "Could not create DB user '${DB_USER}' — it may already exist under a different role"
+  fi
+
+  # ── Ensure DB exists ─────────────────────────────────────────────────────────
+  if ! sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw "${DB_NAME}"; then
+    info "Creating database '${DB_NAME}'..."
+    sudo -u postgres psql -c "CREATE DATABASE \"${DB_NAME}\" OWNER ${DB_USER};" \
+      || die "Failed to create database '${DB_NAME}'. Check PostgreSQL is running and DB_USER has CREATE privilege."
+    ok "Database '${DB_NAME}' created"
+  else
+    ok "Database '${DB_NAME}' exists"
+  fi
+
+  # Grant full access to DB_USER on this database
+  sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"${DB_NAME}\" TO ${DB_USER};" 2>/dev/null || true
+
+  # ── Extensions ───────────────────────────────────────────────────────────────
   sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || \
-    warn "pgvector extension not available — face embedding features will not work. Install with: apt-get install postgresql-16-pgvector"
+    warn "pgvector not available — face embedding features will not work. Install: apt-get install postgresql-16-pgvector"
   sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;" 2>/dev/null || true
 
   local backend_env="${APP_DIR}/backend/.env"
