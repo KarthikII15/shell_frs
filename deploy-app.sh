@@ -391,9 +391,9 @@ validate() {
   case "$DEPLOY_MODE" in
     domain-http|domain-ssl|selfsigned)
       [[ -n "$DOMAIN" ]] || die "DOMAIN is required for DEPLOY_MODE=$DEPLOY_MODE. Set it in deploy.conf or pass --domain."
-      ;;
-    domain-ssl)
-      [[ -n "$CERTBOT_EMAIL" ]] || warn "CERTBOT_EMAIL not set — certbot will prompt interactively."
+      if [[ "$DEPLOY_MODE" == "domain-ssl" ]]; then
+        [[ -n "$CERTBOT_EMAIL" ]] || warn "CERTBOT_EMAIL not set — certbot will prompt interactively."
+      fi
       ;;
     ip-only|dev) ;;
     *)
@@ -835,20 +835,19 @@ setup_dirs() {
 #──────────────────────────────────────────────────────────────────────────────
 install_backend_deps() {
   log "Installing backend npm dependencies"
-  cd "${APP_DIR}/backend"
-  sudo -u "$REAL_USER" "$NPM_BIN" ci --omit=dev --prefer-offline 2>/dev/null \
-    || sudo -u "$REAL_USER" "$NPM_BIN" install --omit=dev
+  (cd "${APP_DIR}/backend" && \
+    { sudo -u "$REAL_USER" "$NPM_BIN" ci --omit=dev --prefer-offline 2>/dev/null || \
+      sudo -u "$REAL_USER" "$NPM_BIN" install --omit=dev; })
   ok "Backend dependencies installed"
 }
 
 build_frontend() {
   log "Building React frontend"
-  cd "${APP_DIR}"
   info "Installing frontend npm dependencies..."
-  sudo -u "$REAL_USER" "$NPM_BIN" ci --prefer-offline 2>/dev/null \
-    || sudo -u "$REAL_USER" "$NPM_BIN" install
+  (cd "${APP_DIR}" && sudo -u "$REAL_USER" "$NPM_BIN" ci --prefer-offline 2>/dev/null) || \
+  (cd "${APP_DIR}" && sudo -u "$REAL_USER" "$NPM_BIN" install)
   info "Running Vite build..."
-  sudo -u "$REAL_USER" "$NPM_BIN" run build
+  (cd "${APP_DIR}" && sudo -u "$REAL_USER" "$NPM_BIN" run build)
   [[ -f "${APP_DIR}/dist/index.html" ]] || die "Vite build finished but dist/index.html not found."
   ok "Frontend built → ${APP_DIR}/dist"
 }
@@ -885,12 +884,47 @@ run_migrations() {
   sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;" 2>/dev/null || true
 
   local backend_env="${APP_DIR}/backend/.env"
+  local migrations_dir="${APP_DIR}/backend/src/db/migrations"
+  local schema_file="${migrations_dir}/schema.sql"
+
   [[ -f "$backend_env" ]] \
-    || die "backend/.env not found at $backend_env — write_backend_env failed. Check disk space and directory permissions."
+    || die "backend/.env not found at $backend_env — write_backend_env failed. Check disk space and permissions."
+
+  # Regenerate schema.sql if any individual migration file is newer than it,
+  # so adding a new .sql file is automatically picked up on next deploy.
+  local needs_rebuild=false
+  [[ -f "$schema_file" ]] || needs_rebuild=true
+  if [[ "$needs_rebuild" == "false" ]]; then
+    for f in "$migrations_dir"/*.sql; do
+      [[ "$(basename $f)" == "schema.sql" ]] && continue
+      [[ "$f" -nt "$schema_file" ]] && needs_rebuild=true && break
+    done
+  fi
+
+  if [[ "$needs_rebuild" == "true" ]]; then
+    info "Consolidating migration files into schema.sql..."
+    {
+      echo "-- FRS Consolidated Schema — generated $(date)"
+      for f in $(ls "$migrations_dir"/*.sql | grep -v "/schema\.sql$" | sort); do
+        echo ""
+        echo "-- $(basename $f)"
+        python3 -c "
+import sys
+with open('$f') as fh:
+    for line in fh:
+        if not line.lstrip().startswith('\\\\'):
+            sys.stdout.write(line)
+"
+      done
+    } > "$schema_file"
+    chown "${REAL_USER}:${REAL_USER}" "$schema_file"
+    ok "schema.sql rebuilt ($(wc -l < "$schema_file") lines)"
+  else
+    ok "schema.sql is up to date"
+  fi
 
   # Load .env line-by-line with `export "KEY=VALUE"` so values containing
-  # spaces (e.g. APP_NAME="FRS Backend") are handled correctly — plain
-  # `source .env` would treat the second word as a shell command.
+  # spaces (e.g. APP_NAME="FRS Backend") are handled correctly.
   sudo -u "$REAL_USER" bash -c "
     while IFS= read -r _line || [[ -n \"\$_line\" ]]; do
       [[ \"\$_line\" =~ ^[[:space:]]*# ]] && continue
@@ -899,8 +933,8 @@ run_migrations() {
     done < '${backend_env}'
     export NODE_ENV='${NODE_ENV}'
     '${NODE_BIN}' '${APP_DIR}/backend/scripts/migrate.js'
-  " && ok "Migrations complete" \
-    || die "Database migration failed. Check: pm2 logs frs-backend  and  journalctl -u postgresql"
+  " && ok "Schema applied successfully" \
+    || die "Database migration failed. Check: journalctl -u postgresql -n 30"
 }
 
 #──────────────────────────────────────────────────────────────────────────────
@@ -970,10 +1004,15 @@ kc_token() {
   resp=$(curl -sf \
     -X POST "http://localhost:${KEYCLOAK_HTTP_PORT}/realms/master/protocol/openid-connect/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
-    -d "grant_type=password&client_id=admin-cli&username=${KEYCLOAK_ADMIN_USER}&password=${KEYCLOAK_ADMIN_PASSWORD}") \
+    --data-urlencode "grant_type=password" \
+    --data-urlencode "client_id=admin-cli" \
+    --data-urlencode "username=${KEYCLOAK_ADMIN_USER}" \
+    --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD}") \
     || die "Could not get Keycloak admin token. Check KEYCLOAK_ADMIN_USER and KEYCLOAK_ADMIN_PASSWORD."
-  python3 -c "import sys,json; print(json.loads('''${resp}''')['access_token'])" 2>/dev/null \
-    || die "Could not parse Keycloak admin token response."
+  # Feed response via stdin — avoids triple-quote quoting issues with shell-special chars in the JSON.
+  printf '%s' "${resp}" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null \
+    || die "Could not parse Keycloak admin token response. Raw: ${resp:0:200}"
 }
 
 provision_keycloak() {
@@ -1369,7 +1408,7 @@ configure_nginx() {
 
   # Verify the frontend was built before writing a config that points at it
   [[ -f "${APP_DIR}/dist/index.html" ]] \
-    || die "Frontend dist/index.html not found. Run install_and_build first."
+    || die "Frontend dist/index.html not found — build_frontend must run before configure_nginx."
 
   local nginx_conf_dest use_sites_dir=false
   if [[ -d /etc/nginx/sites-available ]]; then
