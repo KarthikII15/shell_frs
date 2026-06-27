@@ -1018,12 +1018,17 @@ _resolve_kc_path() {
 
 wait_for_keycloak() {
   _resolve_kc_path
-  info "Waiting for Keycloak to be ready (up to 90s)... [path: ${KC_INTERNAL_PATH:-/}]"
+  info "Waiting for Keycloak to be ready (up to 180s)... [path: ${KC_INTERNAL_PATH:-/}]"
   local i=0
   local probe="http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INTERNAL_PATH}/realms/master"
   until curl -sf --max-time 5 "$probe" &>/dev/null; do
     i=$((i + 1))
-    [[ $i -ge 18 ]] && die "Keycloak did not become ready in 90s. Check: journalctl -u keycloak"
+    if [[ $i -ge 36 ]]; then
+      echo ""
+      warn "Keycloak status:"
+      systemctl status keycloak --no-pager -l 2>/dev/null | tail -20 || true
+      die "Keycloak did not become ready in 180s. Check: journalctl -u keycloak --no-pager | tail -30"
+    fi
     sleep 5
     printf "."
   done
@@ -1066,8 +1071,14 @@ provision_keycloak() {
       local kc_conf="${KC_HOME}/conf/keycloak.conf"
       if ! grep -q "http-relative-path" "$kc_conf" 2>/dev/null; then
         echo "http-relative-path=/auth" >> "$kc_conf"
+        # kc.sh build requires exclusive access — stop Keycloak first or the
+        # Quarkus re-augmentation can produce an inconsistent binary that
+        # fails to boot on the subsequent 'start --optimized'.
+        info "Stopping Keycloak before kc.sh build (requires exclusive access)..."
+        systemctl stop keycloak 2>/dev/null || true
+        sleep 2
         info "Running kc.sh build (required after conf change)..."
-        sudo -u keycloak "$KC_BIN" build 2>/dev/null \
+        sudo -u keycloak "$KC_BIN" build \
           || warn "kc.sh build reported issues — Keycloak may not serve at /auth/"
         kc_conf_changed=true
       fi
@@ -1081,9 +1092,10 @@ provision_keycloak() {
     fi
 
     if [[ "$kc_conf_changed" == "true" ]]; then
-      info "Restarting Keycloak after config change..."
-      systemctl restart keycloak 2>/dev/null || true
-      # Wait properly — Keycloak takes 30-60s to boot after kc.sh build
+      info "Starting Keycloak after build..."
+      # Use start (not restart) — we already stopped it before the build
+      systemctl start keycloak || die "systemctl start keycloak failed — run: journalctl -u keycloak -n 30 --no-pager"
+      # After a kc.sh build the Quarkus re-augmentation adds startup overhead
       wait_for_keycloak
     fi
     TOKEN=$(kc_token)  # refresh token (old token expired during restart)
