@@ -995,12 +995,33 @@ EOF
 #──────────────────────────────────────────────────────────────────────────────
 # KEYCLOAK PROVISIONING  (idempotent — 409 = already exists → ok)
 #──────────────────────────────────────────────────────────────────────────────
+# Detect Keycloak's configured http-relative-path (e.g. /auth).
+# This changes EVERY internal API endpoint, so it must be resolved once and
+# used consistently in wait_for_keycloak, kc_token, and provision_keycloak.
+KC_INTERNAL_PATH=""
+_resolve_kc_path() {
+  local conf=""
+  # Production: path is in keycloak.conf
+  [[ -f "${KC_HOME}/conf/keycloak.conf" ]] && conf="${KC_HOME}/conf/keycloak.conf"
+  # Dev/start-dev: path is in the systemd unit ExecStart flag
+  if [[ -z "$conf" ]]; then
+    local svc_file="/etc/systemd/system/keycloak.service"
+    if [[ -f "$svc_file" ]] && grep -q "http-relative-path" "$svc_file"; then
+      KC_INTERNAL_PATH="/auth"
+      return
+    fi
+  fi
+  if [[ -n "$conf" ]] && grep -q "http-relative-path=/auth" "$conf" 2>/dev/null; then
+    KC_INTERNAL_PATH="/auth"
+  fi
+}
+
 wait_for_keycloak() {
-  info "Waiting for Keycloak to be ready (up to 90s)..."
+  _resolve_kc_path
+  info "Waiting for Keycloak to be ready (up to 90s)... [path: ${KC_INTERNAL_PATH:-/}]"
   local i=0
-  # /realms/master is the most reliable readiness probe — it responds as soon as
-  # Keycloak is fully booted regardless of whether health-enabled=true is set.
-  until curl -sf --max-time 5 "http://localhost:${KEYCLOAK_HTTP_PORT}/realms/master" &>/dev/null; do
+  local probe="http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INTERNAL_PATH}/realms/master"
+  until curl -sf --max-time 5 "$probe" &>/dev/null; do
     i=$((i + 1))
     [[ $i -ge 18 ]] && die "Keycloak did not become ready in 90s. Check: journalctl -u keycloak"
     sleep 5
@@ -1013,7 +1034,7 @@ wait_for_keycloak() {
 kc_token() {
   local resp
   resp=$(curl -sf \
-    -X POST "http://localhost:${KEYCLOAK_HTTP_PORT}/realms/master/protocol/openid-connect/token" \
+    -X POST "http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INTERNAL_PATH}/realms/master/protocol/openid-connect/token" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "grant_type=password" \
     --data-urlencode "client_id=admin-cli" \
@@ -1030,10 +1051,12 @@ provision_keycloak() {
   [[ "$AUTH_MODE" != "keycloak" ]] && { info "AUTH_MODE=$AUTH_MODE — skipping Keycloak provisioning"; return; }
   log "Provisioning Keycloak"
 
-  wait_for_keycloak
+  wait_for_keycloak   # also calls _resolve_kc_path → sets KC_INTERNAL_PATH
   local TOKEN
   TOKEN=$(kc_token)
-  local KC_BASE="http://localhost:${KEYCLOAK_HTTP_PORT}"
+  # KC_BASE includes the http-relative-path so every admin API call is correct
+  # whether Keycloak is at / (default) or /auth (nginx proxy mode).
+  local KC_BASE="http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INTERNAL_PATH}"
 
   # ── Configure Keycloak relative path for SSL modes (nginx /auth/ proxy) ──
   local kc_conf_changed=false
