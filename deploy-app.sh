@@ -762,6 +762,7 @@ EOF
 
   mv "$tmp_env" "$env_file"
   chmod 640 "$env_file"
+  chown "${REAL_USER}:${REAL_USER}" "$env_file"
   ok "backend/.env written ($(wc -l < "$env_file") lines) → $env_file"
 }
 
@@ -786,6 +787,7 @@ ${VITE_APP_VERSION:+VITE_APP_VERSION=${VITE_APP_VERSION}}
 ${VITE_SENTRY_DSN:+VITE_SENTRY_DSN=${VITE_SENTRY_DSN}}
 EOF
 
+  chown "${REAL_USER}:${REAL_USER}" "${APP_DIR}/.env"
   ok "root .env written"
 }
 
