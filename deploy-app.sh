@@ -943,16 +943,29 @@ with open('$f') as fh:
 
   # Load .env line-by-line with `export "KEY=VALUE"` so values containing
   # spaces (e.g. APP_NAME="FRS Backend") are handled correctly.
-  sudo -u "$REAL_USER" bash -c "
+  local _env_loader="
     while IFS= read -r _line || [[ -n \"\$_line\" ]]; do
       [[ \"\$_line\" =~ ^[[:space:]]*# ]] && continue
       [[ -z \"\${_line//[[:space:]]/}\" ]] && continue
       export \"\$_line\" 2>/dev/null || true
     done < '${backend_env}'
     export NODE_ENV='${NODE_ENV}'
+  "
+
+  sudo -u "$REAL_USER" bash -c "
+    ${_env_loader}
     '${NODE_BIN}' '${APP_DIR}/backend/scripts/migrate.js'
   " && ok "Schema applied successfully" \
     || die "Database migration failed. Check: journalctl -u postgresql -n 30"
+
+  # Seed platform reference data — nav menus, tenant types, device types,
+  # role capability grants. Idempotent (ON CONFLICT DO UPDATE / DO NOTHING).
+  # Runs on every deploy so new rows are picked up without a schema reset.
+  sudo -u "$REAL_USER" bash -c "
+    ${_env_loader}
+    '${NODE_BIN}' '${APP_DIR}/backend/scripts/seed_platform.js'
+  " && ok "Platform reference data seeded" \
+    || warn "Platform seed failed — some reference data may be missing (menus, tenant types, device types)"
 }
 
 #──────────────────────────────────────────────────────────────────────────────
