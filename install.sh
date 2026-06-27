@@ -256,8 +256,20 @@ install_keycloak() {
     chown -R keycloak:keycloak "/opt/keycloak-${KEYCLOAK_VERSION}"
   fi
 
-  log "Writing Keycloak config (Postgres backend)"
-  cat > /opt/keycloak/conf/keycloak.conf <<EOF
+  # Only write config + run build + write service unit on first install.
+  # Skipping on re-run preserves any extra settings (e.g. http-relative-path=/auth)
+  # that deploy-app.sh adds after the initial install.sh run.
+  if systemctl is-enabled keycloak --quiet 2>/dev/null; then
+    ok "Keycloak service already configured — skipping config write and build"
+    # Ensure admin credentials env vars are current in case password changed
+    local svc=/etc/systemd/system/keycloak.service
+    if ! grep -q "KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}" "$svc" 2>/dev/null; then
+      sed -i "s|^Environment=KC_BOOTSTRAP_ADMIN_PASSWORD=.*|Environment=KC_BOOTSTRAP_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}|" "$svc"
+      systemctl daemon-reload
+    fi
+  else
+    log "Writing Keycloak config (Postgres backend)"
+    cat > /opt/keycloak/conf/keycloak.conf <<EOF
 db=postgres
 db-username=${DB_USER}
 db-password=${DB_PASSWORD}
@@ -269,12 +281,12 @@ http-port=${KEYCLOAK_HTTP_PORT}
 hostname-strict=false
 proxy-headers=xforwarded
 EOF
-  chown keycloak:keycloak /opt/keycloak/conf/keycloak.conf
+    chown keycloak:keycloak /opt/keycloak/conf/keycloak.conf
 
-  log "Building Keycloak (one-time, for --optimized start)"
-  sudo -u keycloak /opt/keycloak/bin/kc.sh build || warn "kc.sh build reported issues (often safe on first run)"
+    log "Building Keycloak (one-time, for --optimized start)"
+    sudo -u keycloak /opt/keycloak/bin/kc.sh build || warn "kc.sh build reported issues (often safe on first run)"
 
-  cat > /etc/systemd/system/keycloak.service <<EOF
+    cat > /etc/systemd/system/keycloak.service <<EOF
 [Unit]
 Description=Keycloak ${KEYCLOAK_VERSION}
 After=network.target postgresql.service
@@ -290,8 +302,14 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now keycloak
+    systemctl daemon-reload
+    systemctl enable --now keycloak
+  fi
+
+  if ! systemctl is-active keycloak --quiet 2>/dev/null; then
+    info "Starting Keycloak..."
+    systemctl start keycloak
+  fi
   ok "Keycloak running on :${KEYCLOAK_HTTP_PORT} (admin console at /admin/)"
 }
 

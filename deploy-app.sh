@@ -437,7 +437,7 @@ preflight() {
   # /health/live requires health-enabled=true in keycloak.conf (not on by default in production).
   # Prefer: systemctl active → port open → /realms/master responds.
   check_service "Keycloak"    "systemctl is-active keycloak --quiet 2>/dev/null || nc -z localhost ${KEYCLOAK_HTTP_PORT} 2>/dev/null" true
-  check_service "Nginx"       "nginx -t" true
+  check_service "Nginx"       "systemctl is-active nginx --quiet 2>/dev/null" true
   check_service "Redis"       "redis-cli ping" false
   check_service "Kafka"       "nc -z localhost 9092" false
 
