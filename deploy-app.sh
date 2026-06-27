@@ -76,6 +76,11 @@ KEYCLOAK_LOGIN_THEME=motivity-frs
 KEYCLOAK_CLOCK_TOLERANCE_SEC=5
 KEYCLOAK_STRICT_AUDIENCE=false
 
+# First super-admin (created in Keycloak during provisioning)
+SUPER_ADMIN_EMAIL=
+SUPER_ADMIN_USERNAME=admin
+SUPER_ADMIN_PASSWORD=
+
 # Secrets (auto-generated when blank)
 DEVICE_JWT_SECRET=
 ENROLLMENT_TOKEN_SECRET=
@@ -848,9 +853,14 @@ run_migrations() {
 
   sudo -u postgres psql -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;" 2>/dev/null || true
 
-  cd "${APP_DIR}/backend"
+  local backend_env="${APP_DIR}/backend/.env"
+  [[ -f "$backend_env" ]] || die "backend/.env not found at $backend_env — write_backend_env may have failed."
+
+  # Use --env-file so dotenv.config() in env.js finds the file regardless of
+  # what process.cwd() resolves to under sudo -u.
   sudo -u "$REAL_USER" env NODE_ENV="$NODE_ENV" \
-    "$NODE_BIN" scripts/migrate.js \
+    "$NODE_BIN" --env-file "$backend_env" \
+    "${APP_DIR}/backend/scripts/migrate.js" \
     && ok "Migrations complete" \
     || die "Database migration failed. Check backend/.env and PostgreSQL connectivity."
 }
@@ -1051,6 +1061,69 @@ provision_keycloak() {
       || warn "Could not seed role '${role}' (HTTP $rstatus)"
   done
   ok "Realm roles seeded"
+
+  # ── Create first super-admin user ─────────────────────────────────────────
+  if [[ -n "$SUPER_ADMIN_EMAIL" && -n "$SUPER_ADMIN_PASSWORD" ]]; then
+    info "Creating super-admin user: ${SUPER_ADMIN_EMAIL}..."
+
+    # Refresh token before user operations
+    TOKEN=$(kc_token)
+
+    # Create user
+    local ustatus
+    ustatus=$(curl -so /dev/null -w "%{http_code}" \
+      -X POST "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/users" \
+      -H "Authorization: Bearer ${TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"username\": \"${SUPER_ADMIN_USERNAME}\",
+        \"email\": \"${SUPER_ADMIN_EMAIL}\",
+        \"enabled\": true,
+        \"emailVerified\": true
+      }")
+
+    if [[ "$ustatus" == "409" ]]; then
+      ok "Super-admin '${SUPER_ADMIN_EMAIL}' already exists — skipping"
+    elif [[ "$ustatus" == "201" ]]; then
+      # Get the new user's ID
+      local user_id
+      user_id=$(curl -sf \
+        "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/users?email=${SUPER_ADMIN_EMAIL}" \
+        -H "Authorization: Bearer ${TOKEN}" \
+        | python3 -c "import sys,json; users=json.load(sys.stdin); print(users[0]['id']) if users else exit(1)" 2>/dev/null) \
+        || die "Could not retrieve ID for newly created super-admin user."
+
+      # Set password (non-temporary so user isn't forced to change on first login)
+      curl -sf \
+        -X PUT "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/users/${user_id}/reset-password" \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"type\": \"password\", \"value\": \"${SUPER_ADMIN_PASSWORD}\", \"temporary\": false}" \
+        || die "Could not set password for super-admin user."
+
+      # Assign super_admin realm role
+      local role_json
+      role_json=$(curl -sf \
+        "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/roles/super_admin" \
+        -H "Authorization: Bearer ${TOKEN}") \
+        || die "Could not fetch super_admin role definition."
+
+      curl -sf \
+        -X POST "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/users/${user_id}/role-mappings/realm" \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "[${role_json}]" \
+        || die "Could not assign super_admin role to user."
+
+      ok "Super-admin created: ${SUPER_ADMIN_EMAIL} (role: super_admin)"
+    else
+      warn "Could not create super-admin user (HTTP $ustatus) — create it manually in Keycloak admin"
+    fi
+  else
+    warn "SUPER_ADMIN_EMAIL or SUPER_ADMIN_PASSWORD not set — skipping user creation"
+    warn "Create the first user manually at: http://localhost:${KEYCLOAK_HTTP_PORT}/admin"
+  fi
+
   ok "Keycloak provisioning complete"
 }
 
@@ -1066,11 +1139,12 @@ create_kafka_topics() {
     return
   fi
 
-  cd "${APP_DIR}/backend"
+  local backend_env="${APP_DIR}/backend/.env"
   # Force NODE_ENV=development: KafkaConfig enforces SSL in production,
   # but install.sh provides a plain (no-SSL) single-node Kafka.
   sudo -u "$REAL_USER" env NODE_ENV=development KAFKA_SSL_ENABLED=false \
-    "$NODE_BIN" scripts/create-topics.js \
+    "$NODE_BIN" --env-file "$backend_env" \
+    "${APP_DIR}/backend/scripts/create-topics.js" \
     && ok "Kafka topics created/verified" \
     || warn "Kafka topic creation failed — topics will auto-create on first use"
 }
@@ -1250,27 +1324,28 @@ configure_nginx() {
   [[ "$DEPLOY_MODE" == "dev" ]] && { info "Dev mode — skipping nginx configuration"; return; }
   log "Configuring nginx"
 
-  # Determine conf destination
-  local nginx_conf_dest
+  # Verify the frontend was built before writing a config that points at it
+  [[ -f "${APP_DIR}/dist/index.html" ]] \
+    || die "Frontend dist/index.html not found. Run install_and_build first."
+
+  local nginx_conf_dest use_sites_dir=false
   if [[ -d /etc/nginx/sites-available ]]; then
     nginx_conf_dest=/etc/nginx/sites-available/frs
-    # Disable default site to avoid server_name conflicts
-    rm -f /etc/nginx/sites-enabled/default
-    ln -sfn "$nginx_conf_dest" /etc/nginx/sites-enabled/frs
+    use_sites_dir=true
   else
-    # Official nginx.org package uses conf.d/
     nginx_conf_dest=/etc/nginx/conf.d/frs.conf
-    rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
   fi
 
   local server_name="${DOMAIN:-_}"
 
+  # Write the config file first, then enable/link it
   case "$DEPLOY_MODE" in
     ip-only|domain-http)
       generate_nginx_conf "$server_name" "http" > "$nginx_conf_dest"
       ;;
     domain-ssl)
-      # Write an HTTP-only config first so certbot can complete the ACME challenge
+      # Serve plain HTTP initially so certbot can complete the ACME challenge.
+      # setup_ssl() rewrites this to the full HTTPS config after cert issuance.
       generate_nginx_conf "$server_name" "http" > "$nginx_conf_dest"
       ;;
     selfsigned)
@@ -1278,9 +1353,18 @@ configure_nginx() {
       ;;
   esac
 
+  # Enable the site (must happen after the file is written)
+  if [[ "$use_sites_dir" == "true" ]]; then
+    rm -f /etc/nginx/sites-enabled/default        # remove default page
+    ln -sfn "$nginx_conf_dest" /etc/nginx/sites-enabled/frs
+    info "Enabled: sites-enabled/frs → $nginx_conf_dest"
+  else
+    rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
+  fi
+
   nginx -t || die "nginx config test failed — check $nginx_conf_dest"
   systemctl reload nginx
-  ok "nginx configured and reloaded"
+  ok "nginx configured and reloaded → serving from ${APP_DIR}/dist"
 }
 
 #──────────────────────────────────────────────────────────────────────────────
@@ -1373,6 +1457,7 @@ start_pm2() {
     "$PM2_BIN" start "${APP_DIR}/backend/src/server.js" \
       --name        "frs-backend" \
       --cwd         "${APP_DIR}/backend" \
+      --node-args   "--env-file ${APP_DIR}/backend/.env" \
       --output      "/var/log/frs/backend-out.log" \
       --error       "/var/log/frs/backend-err.log" \
       --time \
