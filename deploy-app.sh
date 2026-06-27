@@ -206,6 +206,18 @@ CONF_FILE="${SCRIPT_DIR}/deploy.conf"
 
 load_conf() {
   local conf="${1:-$CONF_FILE}"
+
+  # Load install.sh state file first — written automatically after install.sh runs.
+  # It carries DB_PASSWORD, KEYCLOAK_ADMIN_PASSWORD, ports and versions so you
+  # never have to copy them manually. deploy.conf (loaded next) can override any value.
+  local install_state="/etc/frs/install.env"
+  if [[ -f "$install_state" ]]; then
+    set -o allexport
+    source "$install_state"
+    set +o allexport
+    info "Loaded install state from $install_state"
+  fi
+
   if [[ -f "$conf" ]]; then
     info "Loading config: $conf"
     # shellcheck source=/dev/null
@@ -213,7 +225,7 @@ load_conf() {
     source "$conf"
     set +o allexport
   else
-    warn "No deploy.conf found at $conf — using defaults and CLI args only"
+    info "No deploy.conf found — using install state + CLI args"
   fi
 }
 
@@ -417,7 +429,9 @@ preflight() {
   }
 
   check_service "PostgreSQL"  "pg_isready -h $DB_HOST -p $DB_PORT -U $DB_USER -q" true
-  check_service "Keycloak"    "curl -sf http://localhost:${KEYCLOAK_HTTP_PORT}/health/live" true
+  # /health/live requires health-enabled=true in keycloak.conf (not on by default in production).
+  # Prefer: systemctl active → port open → /realms/master responds.
+  check_service "Keycloak"    "systemctl is-active keycloak --quiet 2>/dev/null || nc -z localhost ${KEYCLOAK_HTTP_PORT} 2>/dev/null" true
   check_service "Nginx"       "nginx -t" true
   check_service "Redis"       "redis-cli ping" false
   check_service "Kafka"       "nc -z localhost 9092" false
@@ -891,7 +905,9 @@ EOF
 wait_for_keycloak() {
   info "Waiting for Keycloak to be ready (up to 90s)..."
   local i=0
-  until curl -sf "http://localhost:${KEYCLOAK_HTTP_PORT}/health/live" &>/dev/null; do
+  # /realms/master is the most reliable readiness probe — it responds as soon as
+  # Keycloak is fully booted regardless of whether health-enabled=true is set.
+  until curl -sf --max-time 5 "http://localhost:${KEYCLOAK_HTTP_PORT}/realms/master" &>/dev/null; do
     i=$((i + 1))
     [[ $i -ge 18 ]] && die "Keycloak did not become ready in 90s. Check: journalctl -u keycloak"
     sleep 5

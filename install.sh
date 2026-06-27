@@ -1,10 +1,15 @@
-#!/usr/bin/env bash
+g the#!/usr/bin/env bash
 #==============================================================================
 # install-stack-debian.sh
 # Full application stack installer for DEBIAN / UBUNTU.
 # Backup for environments without Ansible. Run as root (sudo).
 #
-#   sudo KEYCLOAK_ADMIN_PASSWORD='xxx' DB_PASSWORD='yyy' ./install-stack-debian.sh
+#   1. Fill in Frs-Sh/deploy.conf  (set DB_PASSWORD and KEYCLOAK_ADMIN_PASSWORD)
+#   2. sudo ./install.sh            (reads deploy.conf automatically)
+#   3. sudo ./deploy-app.sh         (reads the same deploy.conf)
+#
+# Alternatively, pass passwords as environment variables:
+#   sudo KEYCLOAK_ADMIN_PASSWORD='xxx' DB_PASSWORD='yyy' ./install.sh
 #
 # Idempotent-ish: each step checks before installing, so re-running is safe.
 #==============================================================================
@@ -28,16 +33,31 @@ KAFKA_PORT="9092"
 FACE_PORT="5050"
 FACE_DIR="/opt/face-service"
 
-# Secrets (override via environment; do NOT hardcode for production)
+ARCH="$(uname -m)"   # expected: x86_64
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+
+# Load deploy.conf if it exists beside this script (passwords only need to be
+# set once — install.sh and deploy-app.sh both read the same file).
+if [[ -f "${SCRIPT_DIR}/deploy.conf" ]]; then
+  set -o allexport
+  source "${SCRIPT_DIR}/deploy.conf"
+  set +o allexport
+  echo -e "\033[1;34m[*]\033[0m Loaded credentials from deploy.conf"
+fi
+
+# Secrets — deploy.conf values take precedence; env vars are the fallback;
+# CHANGE_ME is a last resort that will cause install to warn loudly.
 KEYCLOAK_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
 KEYCLOAK_ADMIN_PASSWORD="${KEYCLOAK_ADMIN_PASSWORD:-CHANGE_ME}"
 KEYCLOAK_DB_NAME="${KEYCLOAK_DB_NAME:-keycloak}"
-FRS_DB_NAME="${FRS_DB_NAME:-FRS}"
+FRS_DB_NAME="${FRS_DB_NAME:-${DB_NAME:-FRS}}"
 DB_USER="${DB_USER:-postgres}"
 DB_PASSWORD="${DB_PASSWORD:-CHANGE_ME}"
 
-ARCH="$(uname -m)"   # expected: x86_64
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
+if [[ "$KEYCLOAK_ADMIN_PASSWORD" == "CHANGE_ME" || "$DB_PASSWORD" == "CHANGE_ME" ]]; then
+  echo -e "\033[1;31m[X]\033[0m Set DB_PASSWORD and KEYCLOAK_ADMIN_PASSWORD in deploy.conf before running install.sh." >&2
+  exit 1
+fi
 #------------------------------------------------------------------------------
 
 log()  { echo -e "\n\033[1;34m[*]\033[0m $*"; }
@@ -368,6 +388,33 @@ EOF
   warn "face-service enabled but NOT started — deploy your Flask app to ${FACE_DIR}/app.py then: systemctl start face-service"
 }
 
+#================================== SAVE STATE ================================
+save_install_state() {
+  local state_dir="/etc/frs"
+  local state_file="${state_dir}/install.env"
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir"
+
+  cat > "$state_file" <<EOF
+# Written by install.sh on $(date)
+# deploy-app.sh reads this file automatically — no need to re-enter these values.
+DB_USER=${DB_USER}
+DB_PASSWORD=${DB_PASSWORD}
+DB_NAME=${FRS_DB_NAME}
+KEYCLOAK_ADMIN_USER=${KEYCLOAK_ADMIN_USER}
+KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+KEYCLOAK_HTTP_PORT=${KEYCLOAK_HTTP_PORT}
+KAFKA_PORT=${KAFKA_PORT}
+FACE_PORT=${FACE_PORT}
+NODE_VERSION=${NODE_VERSION}
+KEYCLOAK_VERSION=${KEYCLOAK_VERSION}
+KAFKA_VERSION=${KAFKA_VERSION}
+EOF
+
+  chmod 600 "$state_file"
+  ok "Install state saved to ${state_file}"
+}
+
 #================================== MAIN =====================================
 main() {
   [[ "$KEYCLOAK_ADMIN_PASSWORD" == "CHANGE_ME" ]] && warn "KEYCLOAK_ADMIN_PASSWORD not set — using placeholder!"
@@ -383,6 +430,7 @@ main() {
   install_keycloak
   install_kafka
   install_face_service
+  save_install_state
   echo
   ok "All components processed. Services: keycloak:${KEYCLOAK_HTTP_PORT} kafka:${KAFKA_PORT} face:${FACE_PORT}(manual start)"
   echo "Remember to open these ports in your cloud security group / ufw."

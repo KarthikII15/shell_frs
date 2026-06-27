@@ -162,17 +162,35 @@ The complete deployment is exactly two steps:
 │  STEP 1                                                     │
 │  sudo ./Frs-Sh/install.sh                                   │
 │                                                             │
+│  Pass passwords once as environment variables:              │
+│  sudo DB_PASSWORD=xxx KEYCLOAK_ADMIN_PASSWORD=yyy \        │
+│       ./install.sh                                          │
+│                                                             │
 │  Installs: Java 21, Node 20, Python 3.12, PostgreSQL 16,   │
-│  Redis, Nginx, Certbot, Keycloak 26, Kafka 3.7             │
-│  Time: 5–15 minutes (depends on internet/offline mode)     │
+│  Redis, Nginx, Certbot, Keycloak 26, Kafka 3.7.            │
+│  Saves config to /etc/frs/install.env when done.           │
+│  Time: 5–15 minutes                                        │
+└─────────────────────────┬───────────────────────────────────┘
+                          │  /etc/frs/install.env
+                          │  (written by install.sh,
+                          │   read by deploy-app.sh)
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  STEP 2  (optional)                                         │
+│  Edit Frs-Sh/deploy.conf                                    │
+│                                                             │
+│  Only needed for: custom domain, SSL, SMTP, Slack, etc.    │
+│  Passwords and ports come from /etc/frs/install.env        │
+│  automatically — no need to repeat them here.              │
+│  Time: 1–2 minutes if needed, skip if IP-only             │
 └─────────────────────────┬───────────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  STEP 2                                                     │
-│  Edit Frs-Sh/deploy.conf  (fill in passwords & mode)       │
+│  STEP 3                                                     │
 │  sudo ./Frs-Sh/deploy-app.sh                                │
 │                                                             │
+│  Reads /etc/frs/install.env + deploy.conf automatically.   │
 │  Builds app, writes .env files, runs DB migrations,        │
 │  provisions Keycloak, creates Kafka topics, configures     │
 │  nginx, sets up PM2, runs health checks.                   │
@@ -180,7 +198,7 @@ The complete deployment is exactly two steps:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Important:** You must run `install.sh` successfully before running `deploy-app.sh`. If `install.sh` was already run on this server previously, you can skip it and go straight to Step 2.
+**Important:** You must run `install.sh` successfully before running `deploy-app.sh`. If `install.sh` was already run on this server previously, you can skip it and go straight to Step 3.
 
 ---
 
@@ -188,16 +206,21 @@ The complete deployment is exactly two steps:
 
 ### Running `install.sh`
 
+Fill in `deploy.conf` first (just the two passwords), then run the script — it reads the same file automatically:
+
 ```bash
 cd /home/ubuntu/FRS/Frs-Sh
 
-# Provide passwords via environment variables
-sudo KEYCLOAK_ADMIN_PASSWORD='your-strong-kc-password' \
-     DB_PASSWORD='your-strong-db-password' \
-     ./install.sh
+# Step 1: set your passwords in deploy.conf
+nano deploy.conf
+#   DB_PASSWORD=your-strong-db-password
+#   KEYCLOAK_ADMIN_PASSWORD=your-strong-kc-password
+
+# Step 2: run install — reads deploy.conf automatically
+sudo ./install.sh
 ```
 
-> **Passwords set here must match what you put in `deploy.conf` later.** Write them down securely.
+Both `install.sh` and `deploy-app.sh` read the same `deploy.conf`, so you set passwords exactly once.
 
 ### What `install.sh` Does
 
@@ -1132,9 +1155,11 @@ This file has `chmod 600`. Keep it secure:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 DEPLOY (first time):
-  sudo KEYCLOAK_ADMIN_PASSWORD='...' DB_PASSWORD='...' ./install.sh
-  nano deploy.conf          ← set passwords + DEPLOY_MODE
-  sudo ./deploy-app.sh
+  sudo DB_PASSWORD=xxx KEYCLOAK_ADMIN_PASSWORD=yyy ./install.sh
+                            ← saves config to /etc/frs/install.env
+  sudo ./deploy-app.sh      ← reads /etc/frs/install.env automatically
+
+  (Optional) nano deploy.conf  ← only needed for domain/SSL/SMTP/Slack
 
 RE-DEPLOY (code update):
   git pull origin main
