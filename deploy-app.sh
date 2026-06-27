@@ -797,6 +797,15 @@ EOF
 setup_dirs() {
   log "Setting up directories"
 
+  # nginx worker (www-data) must be able to traverse every directory in the
+  # path to dist/. Home dirs default to 750 (no other-execute), which causes
+  # 403 Forbidden for all static files served from inside a home directory.
+  local _dir="$APP_DIR"
+  while [[ "$_dir" != "/" ]]; do
+    chmod o+x "$_dir" 2>/dev/null || true
+    _dir="$(dirname "$_dir")"
+  done
+
   # Backend runtime dirs
   mkdir -p "${APP_DIR}/backend/uploads/attendance-photos"
   mkdir -p "${APP_DIR}/backend/uploads/enrollment-photos"
