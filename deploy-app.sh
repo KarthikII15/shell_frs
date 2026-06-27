@@ -466,6 +466,8 @@ VITE_KEYCLOAK_URL=""
 VITE_APP_BASE_DOMAIN_VAL=""
 # Set when nginx should proxy /auth/ to Keycloak (SSL modes only)
 KC_NGINX_PROXY=false
+# Internal Keycloak path prefix — /auth when http-relative-path is active, else ""
+KC_INT_PATH=""
 
 derive_urls() {
   log "Deriving URLs for mode: $DEPLOY_MODE"
@@ -498,7 +500,12 @@ derive_urls() {
   esac
 
   KEYCLOAK_ISSUER="${KC_EXTERNAL_URL}/realms/${KEYCLOAK_REALM}"
-  KEYCLOAK_JWKS_URI="${KC_EXTERNAL_URL}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/certs"
+  # JWKS uses the internal HTTP URL — avoids Node.js rejecting a self-signed
+  # cert on the HTTPS external URL.  The issuer check still uses KC_EXTERNAL_URL
+  # so it matches the 'iss' claim in tokens issued by Keycloak.
+  KC_INT_PATH=""
+  [[ "$KC_NGINX_PROXY" == "true" ]] && KC_INT_PATH="/auth"
+  KEYCLOAK_JWKS_URI="http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INT_PATH}/realms/${KEYCLOAK_REALM}/protocol/openid-connect/certs"
   CLIENT_ORIGIN="${BASE_URL}"
   PUBLIC_BASE_URL="${BASE_URL}"
   APP_URL_VAL="${BASE_URL}"
@@ -625,7 +632,7 @@ ACCESS_TOKEN_TTL_MINUTES=30
 REFRESH_TOKEN_TTL_DAYS=7
 
 # ── Keycloak ─────────────────────────────────────────────────────────────────
-KEYCLOAK_URL=http://localhost:${KEYCLOAK_HTTP_PORT}
+KEYCLOAK_URL=http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INT_PATH}
 KEYCLOAK_REALM=${KEYCLOAK_REALM}
 KEYCLOAK_ISSUER=${KEYCLOAK_ISSUER}
 KEYCLOAK_AUDIENCE=${KEYCLOAK_API_CLIENT_ID}
