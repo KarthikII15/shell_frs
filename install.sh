@@ -112,6 +112,8 @@ install_node() {
   fi
   log "Installing global npm packages (pnpm@${PNPM_VERSION}, pm2@${PM2_VERSION})"
   /opt/nodejs/bin/node /opt/nodejs/bin/npm install -g "pnpm@${PNPM_VERSION}" "pm2@${PM2_VERSION}"
+  # Symlink pm2 into /usr/bin so it is available in all shells without PATH changes
+  ln -sf /opt/nodejs/bin/pm2 /usr/bin/pm2
   ok "Global npm packages installed"
 }
 

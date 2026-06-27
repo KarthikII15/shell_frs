@@ -472,9 +472,11 @@ derive_urls() {
 
   case "$DEPLOY_MODE" in
     ip-only)
-      BASE_URL="http://${SERVER_IP}"
-      KC_EXTERNAL_URL="http://${SERVER_IP}:${KEYCLOAK_HTTP_PORT}"
-      KC_NGINX_PROXY=false
+      # Always use HTTPS even for IP-only — browsers block crypto.subtle
+      # (required by Keycloak PKCE) on plain HTTP non-localhost origins.
+      BASE_URL="https://${SERVER_IP}"
+      KC_EXTERNAL_URL="https://${SERVER_IP}/auth"
+      KC_NGINX_PROXY=true
       ;;
     domain-http)
       BASE_URL="http://${DOMAIN}"
@@ -1091,48 +1093,68 @@ provision_keycloak() {
   # Refresh token after realm ops
   TOKEN=$(kc_token)
 
-  # ── Create attendance-frontend client (public, PKCE) ──────────────────────
-  info "Provisioning client '${KEYCLOAK_CLIENT_ID}'..."
-  local wildcard_origin="${BASE_URL}/*"
-  local fstatus
-  fstatus=$(curl -so /dev/null -w "%{http_code}" \
-    -X POST "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/clients" \
-    -H "Authorization: Bearer ${TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"clientId\": \"${KEYCLOAK_CLIENT_ID}\",
-      \"name\": \"FRS Attendance Frontend\",
-      \"enabled\": true,
-      \"publicClient\": true,
-      \"standardFlowEnabled\": true,
-      \"directAccessGrantsEnabled\": true,
-      \"redirectUris\": [\"${BASE_URL}/*\", \"http://localhost:5173/*\"],
-      \"webOrigins\": [\"${BASE_URL}\", \"http://localhost:5173\"],
-      \"attributes\": {\"pkce.code.challenge.method\": \"S256\"}
-    }")
-  [[ "$fstatus" == "201" || "$fstatus" == "204" || "$fstatus" == "409" ]] \
-    || die "Failed to create frontend client (HTTP $fstatus)"
-  [[ "$fstatus" == "409" ]] && info "Client '${KEYCLOAK_CLIENT_ID}' already exists" \
-    || ok "Client '${KEYCLOAK_CLIENT_ID}' created"
+  # ── Helper: get Keycloak client internal UUID by clientId ─────────────────
+  _kc_client_uuid() {
+    local client_id="$1"
+    curl -sf \
+      "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/clients?clientId=${client_id}" \
+      -H "Authorization: Bearer ${TOKEN}" \
+    | python3 -c "import sys,json; c=json.load(sys.stdin); print(c[0]['id']) if c else exit(1)" 2>/dev/null
+  }
 
-  # ── Create attendance-api client (bearer-only) ────────────────────────────
+  # ── Helper: upsert a client — create if new, update redirectUris/webOrigins if existing ──
+  _kc_upsert_client() {
+    local label="$1" payload="$2" client_id="$3"
+    local status
+    status=$(curl -so /dev/null -w "%{http_code}" \
+      -X POST "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/clients" \
+      -H "Authorization: Bearer ${TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "$payload")
+
+    if [[ "$status" == "201" ]]; then
+      ok "Client '${label}' created"
+    elif [[ "$status" == "409" ]]; then
+      # Client exists — update redirect URIs so HTTP→HTTPS re-deploys work
+      local uuid
+      uuid=$(_kc_client_uuid "$client_id") || { warn "Could not get UUID for '${label}' — skipping update"; return; }
+      local ust
+      ust=$(curl -so /dev/null -w "%{http_code}" \
+        -X PUT "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/clients/${uuid}" \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$payload")
+      [[ "$ust" == "200" || "$ust" == "204" ]] \
+        && ok "Client '${label}' updated (redirectUris synced to ${BASE_URL})" \
+        || warn "Client '${label}' update returned HTTP $ust"
+    else
+      die "Failed to provision client '${label}' (HTTP $status)"
+    fi
+  }
+
+  # ── Create / update attendance-frontend client (public, PKCE) ────────────
+  info "Provisioning client '${KEYCLOAK_CLIENT_ID}'..."
+  _kc_upsert_client "${KEYCLOAK_CLIENT_ID}" "{
+    \"clientId\": \"${KEYCLOAK_CLIENT_ID}\",
+    \"name\": \"FRS Attendance Frontend\",
+    \"enabled\": true,
+    \"publicClient\": true,
+    \"standardFlowEnabled\": true,
+    \"directAccessGrantsEnabled\": true,
+    \"redirectUris\": [\"${BASE_URL}/*\", \"http://localhost:5173/*\"],
+    \"webOrigins\": [\"${BASE_URL}\", \"http://localhost:5173\", \"+\"],
+    \"attributes\": {\"pkce.code.challenge.method\": \"S256\"}
+  }" "${KEYCLOAK_CLIENT_ID}"
+
+  # ── Create / update attendance-api client (bearer-only) ───────────────────
   info "Provisioning client '${KEYCLOAK_API_CLIENT_ID}'..."
-  local astatus
-  astatus=$(curl -so /dev/null -w "%{http_code}" \
-    -X POST "${KC_BASE}/admin/realms/${KEYCLOAK_REALM}/clients" \
-    -H "Authorization: Bearer ${TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"clientId\": \"${KEYCLOAK_API_CLIENT_ID}\",
-      \"name\": \"FRS API\",
-      \"enabled\": true,
-      \"bearerOnly\": true,
-      \"publicClient\": false
-    }")
-  [[ "$astatus" == "201" || "$astatus" == "204" || "$astatus" == "409" ]] \
-    || die "Failed to create API client (HTTP $astatus)"
-  [[ "$astatus" == "409" ]] && info "Client '${KEYCLOAK_API_CLIENT_ID}' already exists" \
-    || ok "Client '${KEYCLOAK_API_CLIENT_ID}' created"
+  _kc_upsert_client "${KEYCLOAK_API_CLIENT_ID}" "{
+    \"clientId\": \"${KEYCLOAK_API_CLIENT_ID}\",
+    \"name\": \"FRS API\",
+    \"enabled\": true,
+    \"bearerOnly\": true,
+    \"publicClient\": false
+  }" "${KEYCLOAK_API_CLIENT_ID}"
 
   # ── Seed realm roles ──────────────────────────────────────────────────────
   info "Seeding realm roles..."
@@ -1431,7 +1453,11 @@ configure_nginx() {
 
   # Write the config file first, then enable/link it
   case "$DEPLOY_MODE" in
-    ip-only|domain-http)
+    ip-only)
+      # Use self-signed HTTPS — plain HTTP blocks crypto.subtle (Keycloak PKCE)
+      generate_nginx_conf "$server_name" "https-selfsigned" > "$nginx_conf_dest"
+      ;;
+    domain-http)
       generate_nginx_conf "$server_name" "http" > "$nginx_conf_dest"
       ;;
     domain-ssl)
@@ -1463,15 +1489,39 @@ configure_nginx() {
 #──────────────────────────────────────────────────────────────────────────────
 setup_ssl() {
   case "$DEPLOY_MODE" in
-    ip-only|domain-http|dev)
+    domain-http|dev)
       return ;;
   esac
 
   log "Setting up TLS"
 
+  local cert_dir="/etc/ssl/frs"
+  mkdir -p "$cert_dir"
+
+  if [[ "$DEPLOY_MODE" == "ip-only" ]]; then
+    if [[ ! -f "${cert_dir}/frs.crt" ]]; then
+      info "Generating self-signed certificate for IP ${SERVER_IP}..."
+      openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout "${cert_dir}/frs.key" \
+        -out    "${cert_dir}/frs.crt" \
+        -subj   "/CN=${SERVER_IP}/O=FRS/C=IN" \
+        -addext "subjectAltName=IP:${SERVER_IP}" 2>/dev/null
+      chmod 600 "${cert_dir}/frs.key"
+      ok "Self-signed certificate generated for IP ${SERVER_IP} (valid 10 years)"
+    else
+      ok "Self-signed certificate already exists — keeping it"
+    fi
+    local nginx_conf_dest
+    [[ -d /etc/nginx/sites-available ]] \
+      && nginx_conf_dest=/etc/nginx/sites-available/frs \
+      || nginx_conf_dest=/etc/nginx/conf.d/frs.conf
+    generate_nginx_conf "_" "https-selfsigned" > "$nginx_conf_dest"
+    nginx -t && systemctl reload nginx
+    ok "nginx reloaded with self-signed TLS for IP access"
+    return
+  fi
+
   if [[ "$DEPLOY_MODE" == "selfsigned" ]]; then
-    local cert_dir="/etc/ssl/frs"
-    mkdir -p "$cert_dir"
     if [[ ! -f "${cert_dir}/frs.crt" ]]; then
       info "Generating self-signed certificate for ${DOMAIN}..."
       openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
@@ -1485,7 +1535,6 @@ setup_ssl() {
       ok "Self-signed certificate already exists — keeping it"
     fi
 
-    # Write the final https-selfsigned nginx config now that cert exists
     local nginx_conf_dest
     [[ -d /etc/nginx/sites-available ]] \
       && nginx_conf_dest=/etc/nginx/sites-available/frs \
