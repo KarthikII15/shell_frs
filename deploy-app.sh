@@ -1036,6 +1036,7 @@ provision_keycloak() {
   local KC_BASE="http://localhost:${KEYCLOAK_HTTP_PORT}"
 
   # ── Configure Keycloak relative path for SSL modes (nginx /auth/ proxy) ──
+  local kc_conf_changed=false
   if [[ "$KC_NGINX_PROXY" == "true" && -n "$KC_BIN" ]]; then
     info "Configuring Keycloak http-relative-path=/auth for nginx proxy"
     if [[ "$KC_START_MODE" == "production" ]]; then
@@ -1045,18 +1046,24 @@ provision_keycloak() {
         info "Running kc.sh build (required after conf change)..."
         sudo -u keycloak "$KC_BIN" build 2>/dev/null \
           || warn "kc.sh build reported issues — Keycloak may not serve at /auth/"
+        kc_conf_changed=true
       fi
     elif [[ "$KC_START_MODE" == "dev" ]]; then
-      # In start-dev mode, update the systemd ExecStart to include the flag
       local svc_file="/etc/systemd/system/keycloak.service"
       if [[ -f "$svc_file" ]] && ! grep -q "http-relative-path" "$svc_file"; then
         sed -i 's|\(ExecStart=.*kc\.sh start-dev\)|\1 --http-relative-path=/auth|' "$svc_file"
         systemctl daemon-reload
+        kc_conf_changed=true
       fi
     fi
-    systemctl restart keycloak 2>/dev/null || true
-    sleep 8
-    TOKEN=$(kc_token)  # refresh token after restart
+
+    if [[ "$kc_conf_changed" == "true" ]]; then
+      info "Restarting Keycloak after config change..."
+      systemctl restart keycloak 2>/dev/null || true
+      # Wait properly — Keycloak takes 30-60s to boot after kc.sh build
+      wait_for_keycloak
+    fi
+    TOKEN=$(kc_token)  # refresh token (old token expired during restart)
   fi
 
   # ── Create realm ─────────────────────────────────────────────────────────
@@ -1617,8 +1624,11 @@ start_pm2() {
   local i=0
   until curl -sf "http://localhost:${BACKEND_PORT}/api/health" &>/dev/null; do
     i=$((i + 1))
-    if [[ $i -ge 30 ]]; then
-      warn "Backend did not respond in 60s — check: pm2 logs frs-backend"
+    if [[ $i -eq 15 ]]; then
+      info "Still starting... (check logs: /opt/nodejs/bin/pm2 logs frs-backend --lines 20)"
+    fi
+    if [[ $i -ge 60 ]]; then
+      warn "Backend did not respond in 120s — check: /opt/nodejs/bin/pm2 logs frs-backend"
       warn "Continuing — Keycloak provisioning may fail if backend is still starting"
       break
     fi
