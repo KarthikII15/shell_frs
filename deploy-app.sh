@@ -1017,23 +1017,39 @@ _resolve_kc_path() {
 }
 
 wait_for_keycloak() {
-  _resolve_kc_path
-  info "Waiting for Keycloak to be ready (up to 180s)... [path: ${KC_INTERNAL_PATH:-/}]"
+  # Try both /auth/realms/master and /realms/master — whichever responds first
+  # wins and sets KC_INTERNAL_PATH for all subsequent API calls.
+  # This handles stale Quarkus builds where http-relative-path is in keycloak.conf
+  # but the build cache from a previous install didn't pick up the change.
+  info "Waiting for Keycloak to be ready (up to 180s)..."
   local i=0
-  local probe="http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INTERNAL_PATH}/realms/master"
-  until curl -sf --max-time 5 "$probe" &>/dev/null; do
-    i=$((i + 1))
-    if [[ $i -ge 36 ]]; then
-      echo ""
-      warn "Keycloak status:"
-      systemctl status keycloak --no-pager -l 2>/dev/null | tail -20 || true
-      die "Keycloak did not become ready in 180s. Check: journalctl -u keycloak --no-pager | tail -30"
+  local base="http://localhost:${KEYCLOAK_HTTP_PORT}"
+  local detected_path="__none__"
+  while [[ "$detected_path" == "__none__" ]]; do
+    if curl -sf --max-time 3 "${base}/auth/realms/master" &>/dev/null; then
+      detected_path="/auth"
+    elif curl -sf --max-time 3 "${base}/realms/master" &>/dev/null; then
+      detected_path=""
+    else
+      i=$((i + 1))
+      if [[ $i -ge 36 ]]; then
+        echo ""
+        warn "Keycloak status:"
+        systemctl status keycloak --no-pager -l 2>/dev/null | tail -20 || true
+        die "Keycloak did not become ready in 180s. Check: journalctl -u keycloak --no-pager | tail -30"
+      fi
+      sleep 5
+      printf "."
     fi
-    sleep 5
-    printf "."
   done
   echo ""
-  ok "Keycloak is up"
+  # Warn if reality differs from what keycloak.conf says
+  _resolve_kc_path
+  if [[ "$KC_INTERNAL_PATH" != "$detected_path" ]]; then
+    warn "Keycloak path mismatch: conf says '${KC_INTERNAL_PATH:-/}' but Keycloak responds at '${detected_path:-/}' — using detected path"
+    KC_INTERNAL_PATH="$detected_path"
+  fi
+  ok "Keycloak is up at path: '${KC_INTERNAL_PATH:-/}'"
 }
 
 kc_token() {
