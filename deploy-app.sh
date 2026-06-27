@@ -1471,6 +1471,13 @@ configure_nginx() {
   [[ -f "${APP_DIR}/dist/index.html" ]] \
     || die "Frontend dist/index.html not found — build_frontend must run before configure_nginx."
 
+  # For SSL modes using a self-signed cert, generate the cert NOW — before
+  # writing the nginx config that references it, so nginx -t doesn't fail
+  # with "no such file" on /etc/ssl/frs/frs.crt.
+  if [[ "$DEPLOY_MODE" == "ip-only" || "$DEPLOY_MODE" == "selfsigned" ]]; then
+    _ensure_selfsigned_cert
+  fi
+
   local nginx_conf_dest use_sites_dir=false
   if [[ -d /etc/nginx/sites-available ]]; then
     nginx_conf_dest=/etc/nginx/sites-available/frs
@@ -1517,6 +1524,32 @@ configure_nginx() {
 #──────────────────────────────────────────────────────────────────────────────
 # SSL SETUP
 #──────────────────────────────────────────────────────────────────────────────
+
+# Generate self-signed cert into /etc/ssl/frs/ if not already present.
+# Called from configure_nginx (before nginx -t) and from certbot fallback.
+_ensure_selfsigned_cert() {
+  local cert_dir="/etc/ssl/frs"
+  mkdir -p "$cert_dir"
+  if [[ -f "${cert_dir}/frs.crt" ]]; then
+    ok "Self-signed certificate already exists — keeping it"
+    return
+  fi
+  local cn san
+  if [[ "$DEPLOY_MODE" == "selfsigned" ]]; then
+    cn="${DOMAIN}"; san="DNS:${DOMAIN},IP:${SERVER_IP}"
+  else
+    cn="${SERVER_IP}"; san="IP:${SERVER_IP}"
+  fi
+  info "Generating self-signed certificate (CN=${cn})..."
+  openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+    -keyout "${cert_dir}/frs.key" \
+    -out    "${cert_dir}/frs.crt" \
+    -subj   "/CN=${cn}/O=FRS/C=IN" \
+    -addext "subjectAltName=${san}" 2>/dev/null
+  chmod 600 "${cert_dir}/frs.key"
+  ok "Self-signed certificate generated → ${cert_dir}/frs.crt"
+}
+
 setup_ssl() {
   case "$DEPLOY_MODE" in
     domain-http|dev)
@@ -1525,55 +1558,15 @@ setup_ssl() {
 
   log "Setting up TLS"
 
+  # ip-only / selfsigned: cert was already generated in configure_nginx()
+  # (before nginx -t ran), so nothing to do here.
+  if [[ "$DEPLOY_MODE" == "ip-only" || "$DEPLOY_MODE" == "selfsigned" ]]; then
+    ok "Self-signed certificate already handled in configure_nginx"
+    return
+  fi
+
   local cert_dir="/etc/ssl/frs"
   mkdir -p "$cert_dir"
-
-  if [[ "$DEPLOY_MODE" == "ip-only" ]]; then
-    if [[ ! -f "${cert_dir}/frs.crt" ]]; then
-      info "Generating self-signed certificate for IP ${SERVER_IP}..."
-      openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "${cert_dir}/frs.key" \
-        -out    "${cert_dir}/frs.crt" \
-        -subj   "/CN=${SERVER_IP}/O=FRS/C=IN" \
-        -addext "subjectAltName=IP:${SERVER_IP}" 2>/dev/null
-      chmod 600 "${cert_dir}/frs.key"
-      ok "Self-signed certificate generated for IP ${SERVER_IP} (valid 10 years)"
-    else
-      ok "Self-signed certificate already exists — keeping it"
-    fi
-    local nginx_conf_dest
-    [[ -d /etc/nginx/sites-available ]] \
-      && nginx_conf_dest=/etc/nginx/sites-available/frs \
-      || nginx_conf_dest=/etc/nginx/conf.d/frs.conf
-    generate_nginx_conf "_" "https-selfsigned" > "$nginx_conf_dest"
-    nginx -t && systemctl reload nginx
-    ok "nginx reloaded with self-signed TLS for IP access"
-    return
-  fi
-
-  if [[ "$DEPLOY_MODE" == "selfsigned" ]]; then
-    if [[ ! -f "${cert_dir}/frs.crt" ]]; then
-      info "Generating self-signed certificate for ${DOMAIN}..."
-      openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "${cert_dir}/frs.key" \
-        -out    "${cert_dir}/frs.crt" \
-        -subj   "/CN=${DOMAIN}/O=FRS/C=IN" \
-        -addext "subjectAltName=DNS:${DOMAIN},IP:${SERVER_IP}" 2>/dev/null
-      chmod 600 "${cert_dir}/frs.key"
-      ok "Self-signed certificate generated (valid 10 years)"
-    else
-      ok "Self-signed certificate already exists — keeping it"
-    fi
-
-    local nginx_conf_dest
-    [[ -d /etc/nginx/sites-available ]] \
-      && nginx_conf_dest=/etc/nginx/sites-available/frs \
-      || nginx_conf_dest=/etc/nginx/conf.d/frs.conf
-    generate_nginx_conf "$DOMAIN" "https-selfsigned" > "$nginx_conf_dest"
-    nginx -t && systemctl reload nginx
-    ok "nginx reloaded with TLS config"
-    return
-  fi
 
   # domain-ssl: certbot
   if ! command -v certbot &>/dev/null && [[ ! -x /opt/certbot/bin/certbot ]]; then
@@ -1606,7 +1599,14 @@ setup_ssl() {
     warn "certbot failed (is ${DOMAIN} pointing to this server's IP?)"
     warn "Falling back to self-signed certificate"
     DEPLOY_MODE=selfsigned
-    setup_ssl
+    _ensure_selfsigned_cert
+    local nginx_conf_dest
+    [[ -d /etc/nginx/sites-available ]] \
+      && nginx_conf_dest=/etc/nginx/sites-available/frs \
+      || nginx_conf_dest=/etc/nginx/conf.d/frs.conf
+    generate_nginx_conf "$DOMAIN" "https-selfsigned" > "$nginx_conf_dest"
+    nginx -t && systemctl reload nginx
+    ok "nginx reloaded with self-signed TLS (certbot fallback)"
   fi
 }
 
