@@ -1133,6 +1133,10 @@ provision_keycloak() {
       systemctl start keycloak || die "systemctl start keycloak failed — run: journalctl -u keycloak -n 30 --no-pager"
       # After a kc.sh build the Quarkus re-augmentation adds startup overhead
       wait_for_keycloak
+      # KC_INTERNAL_PATH was updated by wait_for_keycloak to reflect the new
+      # path (/auth). Re-derive KC_BASE so all subsequent admin API calls use
+      # the correct URL — without this every call returns 404.
+      KC_BASE="http://localhost:${KEYCLOAK_HTTP_PORT}${KC_INTERNAL_PATH}"
     fi
     TOKEN=$(kc_token)  # refresh token (old token expired during restart)
   fi
